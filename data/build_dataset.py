@@ -1,20 +1,12 @@
 """
 build_dataset.py
 ----------------
-Merges all raw source files into the full 6-layer schema and generates
-instruction-response training pairs for each layer.
+Merges all raw source files (NVD, EPSS, GitHub, Blogs) into the full 6-layer schema.
+Generates instruction-response training pairs for each layer.
 
-Layers built:
-  1. Vulnerability Intelligence  (OWASP Mapper + Correlation agents)
-  2. Pentesting Intelligence      (Tool Selector + Scanner agents)
-  3. Risk & Scoring               (Base Scorer + Severity Adjuster agents)
-  4. Execution Context            (Tech Stack Filter + Spawn Decision agents)
-  5. Audit Evidence               (Result Aggregator + Reporting agents)
-  6. Remediation Learning         (Reflector + Memory agents)
-
-Output:
-  data/vuln_dataset.jsonl         — full schema records (one per line)
-  data/training_pairs.jsonl       — instruction-response pairs for fine-tuning
+Updates:
+  - Now integrates 'raw_blogs.json' to provide real-world exploit context.
+  - Adds a new training pair for "Pentesting Intelligence" based on blog write-ups.
 """
 
 import json
@@ -59,16 +51,6 @@ def business_impact(owasp_cat: str) -> str:
     }
     return impacts.get(owasp_cat, "Security breach, data loss")
 
-def infer_exploitability(desc: str) -> str:
-    d = desc.lower()
-    if any(w in d for w in ["remote", "network", "unauthenticated", "internet"]):
-        return "Remotely exploitable — no authentication required based on description."
-    if any(w in d for w in ["local", "physical", "adjacent"]):
-        return "Requires local or adjacent network access to exploit."
-    if any(w in d for w in ["authenticated", "requires login", "privilege"]):
-        return "Requires authenticated access or specific privileges to exploit."
-    return "Exploitability context unclear — manual review recommended."
-
 def infer_security_control_missing(owasp_cat: str) -> str:
     controls = {
         "A03:2021-Injection":                       "Input validation and parameterized queries",
@@ -88,7 +70,7 @@ def load_json(path: str):
     if not p.exists():
         print(f"  ⚠️  {path} not found — skipping")
         return []
-    with open(p) as f:
+    with open(p, encoding="utf-8") as f:
         return json.load(f)
 
 def build_epss_lookup(epss_path: str) -> dict:
@@ -107,9 +89,32 @@ def build_github_lookup(github_path: str) -> dict:
             lookup[cve] = item
     return lookup
 
+def build_blog_lookup(blog_path: str) -> dict:
+    """
+    Returns {cve_id: combined_blog_content}
+    Aggregates blog posts that mention a specific CVE.
+    """
+    raw = load_json(blog_path)
+    lookup = {}
+    for item in raw:
+        content = item.get("content", "")
+        # Cut extremely long blog posts to avoid context window overflow (approx 3k chars)
+        if len(content) > 3000:
+            content = content[:3000] + "... [truncated]"
+        
+        source = f"Source: {item.get('url', 'Unknown Blog')}\n\n{content}"
+
+        for cve in item.get("cves_mentioned", []):
+            cve = cve.upper()
+            if cve in lookup:
+                lookup[cve] += "\n\n---\n\n" + source
+            else:
+                lookup[cve] = source
+    return lookup
+
 # ── Build full schema record ───────────────────────────────────────────────
 
-def build_record(nvd_rec: dict, epss_map: dict, github_map: dict) -> dict:
+def build_record(nvd_rec: dict, epss_map: dict, github_map: dict, blog_map: dict) -> dict:
     cve_id   = nvd_rec.get("cve_id", "")
     cwe_id   = nvd_rec.get("cwe_id", "")
     desc     = clean(nvd_rec.get("description", ""))
@@ -120,6 +125,7 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict) -> dict:
     pentest     = get_pentest_intel(owasp_cat)
     epss_score  = epss_map.get(cve_id, "")
     gh_advisory = github_map.get(cve_id, {})
+    blog_content = blog_map.get(cve_id, "")  # <--- New field
 
     fix_rec = gh_advisory.get("fix_recommendation", "")
     if not fix_rec:
@@ -141,6 +147,7 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict) -> dict:
         "attack_method":         pentest.get("attack_method", ""),
         "payload_example":       pentest.get("payload_example", ""),
         "detection_signals":     pentest.get("detection_signals", []),
+        "real_world_exploit":    blog_content,  # <--- Injected blog data
         "code_pattern":          pentest.get("code_pattern", ""),
 
         # ── Layer 3: Risk & Scoring ───────────────────────
@@ -151,21 +158,16 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict) -> dict:
         "business_impact":       business_impact(owasp_cat),
 
         # ── Layer 4: Execution Context ────────────────────
-        "asset_type":            "Web Application",          # enriched at scan-time
-        "environment":           "Unknown",                  # enriched at scan-time
-        "internet_facing":       True,                       # conservative default
-        "tech_stack":            {
-            "language":  "",
-            "framework": "",
-            "database":  ""
-        },
+        "asset_type":            "Web Application",
+        "environment":           "Unknown",
+        "internet_facing":       True,
+        "tech_stack":            {"language": "", "framework": "", "database": ""},
 
         # ── Layer 5: Audit Evidence ───────────────────────
         "tool_used":             pentest.get("tool_used", "Manual review"),
         "evidence_type":         "vulnerability_research",
         "evidence_summary":      f"Identified via CVE database. CVSS: {cvss}. {desc[:120]}...",
         "security_control_missing": infer_security_control_missing(owasp_cat),
-        "control_type":          "Technical",
 
         # ── Layer 6: Remediation Learning ────────────────
         "fix_recommendation":    fix_rec,
@@ -175,7 +177,7 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict) -> dict:
         # ── Source tracking ───────────────────────────────
         "source":                "NVD + OWASP + FIRST EPSS" + (
             " + GitHub Advisories" if gh_advisory else ""
-        ),
+        ) + (" + Security Blogs" if blog_content else ""),
     }
 
 # ── Generate training pairs ────────────────────────────────────────────────
@@ -183,7 +185,6 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict) -> dict:
 def to_training_pairs(record: dict) -> list[dict]:
     """
     Generate instruction-response pairs covering all 6 dataset layers.
-    Each pair maps to a specific agent's expected use case.
     """
     cve    = record["cve_id"]
     desc   = record["description"]
@@ -199,10 +200,13 @@ def to_training_pairs(record: dict) -> list[dict]:
     ctrl   = record["security_control_missing"]
     tool   = record["tool_used"]
     cwe    = record["cwe_id"]
+    
+    # New: Real-world exploit data
+    exploit_ctx = record.get("real_world_exploit", "")
 
     pairs = []
 
-    # ── L1: Vulnerability Intelligence (OWASP Mapper, Correlation agents) ─
+    # ── L1: Vulnerability Intelligence ────────────────────────────────────
     if desc:
         pairs.append({
             "instruction": f"Explain the vulnerability {cve} and map it to its OWASP category.",
@@ -212,16 +216,7 @@ def to_training_pairs(record: dict) -> list[dict]:
             "agent":       "OWASP Mapper Agent"
         })
 
-    if owasp != "Unknown" and desc:
-        pairs.append({
-            "instruction": "Identify the OWASP Top 10 category for the following vulnerability description.",
-            "input":       desc,
-            "output":      f"This vulnerability maps to {owasp}.\nCWE classification: {cwe}.",
-            "layer":       "vulnerability_intelligence",
-            "agent":       "OWASP Mapper Agent"
-        })
-
-    # ── L2: Pentesting Intelligence (Tool Selector, Scanner agents) ────────
+    # ── L2: Pentesting Intelligence (Updated with Blog Data) ──────────────
     if method:
         pairs.append({
             "instruction": "Describe how to test for this vulnerability during a pentest.",
@@ -234,17 +229,18 @@ def to_training_pairs(record: dict) -> list[dict]:
             "layer":       "pentesting_intelligence",
             "agent":       "Tool Selector Agent"
         })
-
-    if sigs:
+    
+    # NEW PAIR: Real-world exploit context from blogs
+    if exploit_ctx:
         pairs.append({
-            "instruction": "What code patterns or signals indicate this vulnerability is present?",
+            "instruction": f"Provide a real-world exploit example or write-up for {cve}.",
             "input":       desc,
-            "output":      f"Detection signals to look for:\n- " + "\n- ".join(record["detection_signals"]),
+            "output":      f"Here is a real-world context for {cve}:\n\n{exploit_ctx}",
             "layer":       "pentesting_intelligence",
             "agent":       "Scanner Agent"
         })
 
-    # ── L3: Risk & Scoring (Base Scorer, Severity Adjuster agents) ─────────
+    # ── L3: Risk & Scoring ────────────────────────────────────────────────
     if cvss:
         pairs.append({
             "instruction": "Perform a risk assessment for this vulnerability.",
@@ -259,21 +255,7 @@ def to_training_pairs(record: dict) -> list[dict]:
             "agent":       "Base Scorer Agent"
         })
 
-    if cvss:
-        pairs.append({
-            "instruction": "Should this vulnerability be treated as a priority? Explain based on risk scoring.",
-            "input":       f"Vulnerability: {desc}\nCVSS: {cvss}\nEPSS: {epss}",
-            "output":      (
-                f"Priority: {'YES — immediate action required' if risk in ['Critical','High'] else 'Moderate — schedule remediation'}.\n"
-                f"CVSS base score {cvss} classifies this as {sev} severity. "
-                f"{'EPSS score of ' + str(epss) + ' indicates high exploit probability in the wild.' if epss else ''} "
-                f"Business impact: {biz}."
-            ),
-            "layer":       "risk_scoring",
-            "agent":       "Severity Adjuster Agent"
-        })
-
-    # ── L4: Execution Context (Tech Stack Filter, Spawn Decision agents) ───
+    # ── L4: Execution Context ─────────────────────────────────────────────
     if owasp != "Unknown":
         pairs.append({
             "instruction": "Which security tool should be used to test this vulnerability, and why?",
@@ -287,7 +269,7 @@ def to_training_pairs(record: dict) -> list[dict]:
             "agent":       "Tool Selector Agent"
         })
 
-    # ── L5: Audit Evidence (Result Aggregator, Reporting agents) ───────────
+    # ── L5: Audit Evidence ────────────────────────────────────────────────
     if cvss:
         pairs.append({
             "instruction": "Generate an audit finding summary for this vulnerability.",
@@ -304,7 +286,7 @@ def to_training_pairs(record: dict) -> list[dict]:
             "agent":       "Reporting Agent"
         })
 
-    # ── L6: Remediation Learning (Reflector, Memory agents) ───────────────
+    # ── L6: Remediation Learning ──────────────────────────────────────────
     if fix:
         pairs.append({
             "instruction": "What is the recommended remediation for this vulnerability?",
@@ -318,19 +300,6 @@ def to_training_pairs(record: dict) -> list[dict]:
             "agent":       "Reflector Agent"
         })
 
-    if desc and fix:
-        pairs.append({
-            "instruction": "Explain the root cause of this vulnerability and how to prevent it.",
-            "input":       desc,
-            "output":      (
-                f"Root Cause: {ctrl} is missing.\n"
-                f"Prevention: {fix}\n"
-                f"OWASP Category: {owasp}"
-            ),
-            "layer":       "remediation_learning",
-            "agent":       "Learning Agent"
-        })
-
     return pairs
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -340,10 +309,12 @@ def run():
     nvd_records = load_json("data/raw_nvd.json")
     epss_map    = build_epss_lookup("data/raw_epss.json")
     github_map  = build_github_lookup("data/raw_github.json")
+    blog_map    = build_blog_lookup("data/raw_blogs.json") # <--- Load Blogs
 
     print(f"  NVD records:   {len(nvd_records)}")
     print(f"  EPSS entries:  {len(epss_map)}")
     print(f"  GitHub entries:{len(github_map)}")
+    print(f"  Blog entries:  {len(blog_map)} (CVEs matched)")
 
     # ── Build full records ─────────────────────────────────────────────────
     seen_cves = set()
@@ -361,7 +332,7 @@ def run():
             continue
         seen_cves.add(cve_id)
 
-        record = build_record(nvd_rec, epss_map, github_map)
+        record = build_record(nvd_rec, epss_map, github_map, blog_map) # <--- Pass map
         full_records.append(record)
         training_pairs.extend(to_training_pairs(record))
 

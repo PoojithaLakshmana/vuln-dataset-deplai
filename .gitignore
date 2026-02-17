@@ -35,5 +35,4 @@ output/
 # Large files
 *.csv
 *.jsonl
-*.json
 
