@@ -1,12 +1,20 @@
 """
 build_dataset.py
 ----------------
-Merges all raw source files (NVD, EPSS, GitHub, Blogs) into the full 6-layer schema.
+Merges ALL raw source files into the full 6-layer schema.
 Generates instruction-response training pairs for each layer.
 
-Updates:
-  - Now integrates 'raw_blogs.json' to provide real-world exploit context.
-  - Adds a new training pair for "Pentesting Intelligence" based on blog write-ups.
+NEW DATA SOURCES (Beyond Open Web):
+  - raw_papers.json: Research papers from arXiv, IEEE, Google Scholar
+  - raw_closed.json: Mailing lists, bug bounty, vendor advisories, Reddit/SO
+
+Layers built:
+  1. Vulnerability Intelligence  (OWASP Mapper + Correlation agents)
+  2. Pentesting Intelligence      (Tool Selector + Scanner agents)
+  3. Risk & Scoring               (Base Scorer + Severity Adjuster agents)
+  4. Execution Context            (Tech Stack Filter + Spawn Decision agents)
+  5. Audit Evidence               (Result Aggregator + Reporting agents)
+  6. Remediation Learning         (Reflector + Memory agents)
 """
 
 import json
@@ -76,11 +84,10 @@ def load_json(path: str):
 def build_epss_lookup(epss_path: str) -> dict:
     raw = load_json(epss_path)
     if isinstance(raw, dict):
-        return raw           # already {cve_id: score}
+        return raw
     return {}
 
 def build_github_lookup(github_path: str) -> dict:
-    """Returns {cve_id: advisory_record}"""
     raw = load_json(github_path)
     lookup = {}
     for item in raw:
@@ -90,20 +97,14 @@ def build_github_lookup(github_path: str) -> dict:
     return lookup
 
 def build_blog_lookup(blog_path: str) -> dict:
-    """
-    Returns {cve_id: combined_blog_content}
-    Aggregates blog posts that mention a specific CVE.
-    """
     raw = load_json(blog_path)
     lookup = {}
     for item in raw:
         content = item.get("content", "")
-        # Cut extremely long blog posts to avoid context window overflow (approx 3k chars)
         if len(content) > 3000:
             content = content[:3000] + "... [truncated]"
         
         source = f"Source: {item.get('url', 'Unknown Blog')}\n\n{content}"
-
         for cve in item.get("cves_mentioned", []):
             cve = cve.upper()
             if cve in lookup:
@@ -112,9 +113,64 @@ def build_blog_lookup(blog_path: str) -> dict:
                 lookup[cve] = source
     return lookup
 
+def build_papers_lookup(papers_path: str) -> dict:
+    """
+    NEW: Research papers from arXiv, IEEE, Google Scholar
+    """
+    raw = load_json(papers_path)
+    lookup = {}
+    for paper in raw:
+        title = paper.get("title", "Unknown Paper")
+        abstract = paper.get("abstract", "")
+        source = paper.get("source", "research")
+        fulltext = paper.get("fulltext_sample", "")
+        
+        content = f"Research Paper: {title}\nSource: {source}\n\n{abstract}"
+        if fulltext:
+            content += f"\n\nExcerpt: {fulltext[:1000]}"
+        
+        for cve in paper.get("cves_mentioned", []):
+            cve = cve.upper()
+            if cve in lookup:
+                lookup[cve] += "\n\n---\n\n" + content
+            else:
+                lookup[cve] = content
+    return lookup
+
+def build_closed_sources_lookup(closed_path: str) -> dict:
+    """
+    NEW: Closed/semi-private sources - mailing lists, bug bounty, vendor advisories
+    """
+    raw = load_json(closed_path)
+    lookup = {}
+    for item in raw:
+        source_type = item.get("source", "unknown")
+        title = item.get("title", "")
+        content = item.get("content", item.get("summary", item.get("body", "")))
+        
+        if source_type == "full_disclosure":
+            header = f"Full Disclosure Mailing List:\n{content[:1500]}"
+        elif source_type == "hackerone":
+            header = f"HackerOne Report: {title}\nSeverity: {item.get('severity', 'N/A')}\n{content[:1000]}"
+        elif source_type == "microsoft_msrc":
+            header = f"Microsoft Security Advisory: {title}\n{content[:1000]}"
+        elif source_type == "reddit_netsec":
+            header = f"Reddit /r/netsec: {title}\nScore: {item.get('score', 0)}\n{content[:1000]}"
+        else:
+            header = f"{source_type}: {content[:1000]}"
+        
+        for cve in item.get("cves_mentioned", []):
+            cve = cve.upper()
+            if cve in lookup:
+                lookup[cve] += "\n\n---\n\n" + header
+            else:
+                lookup[cve] = header
+    return lookup
+
 # ── Build full schema record ───────────────────────────────────────────────
 
-def build_record(nvd_rec: dict, epss_map: dict, github_map: dict, blog_map: dict) -> dict:
+def build_record(nvd_rec: dict, epss_map: dict, github_map: dict, blog_map: dict, 
+                papers_map: dict, closed_map: dict) -> dict:
     cve_id   = nvd_rec.get("cve_id", "")
     cwe_id   = nvd_rec.get("cwe_id", "")
     desc     = clean(nvd_rec.get("description", ""))
@@ -125,14 +181,20 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict, blog_map: dict
     pentest     = get_pentest_intel(owasp_cat)
     epss_score  = epss_map.get(cve_id, "")
     gh_advisory = github_map.get(cve_id, {})
-    blog_content = blog_map.get(cve_id, "")  # <--- New field
+    blog_content = blog_map.get(cve_id, "")
+    
+    # NEW: Research papers + closed sources
+    research_context = papers_map.get(cve_id, "")
+    closed_context = closed_map.get(cve_id, "")
 
     fix_rec = gh_advisory.get("fix_recommendation", "")
     if not fix_rec:
         fix_rec = "Apply vendor-supplied patches. Implement input validation and follow secure coding practices."
 
+    # Combine all real-world context
+    combined_context = "\n\n".join(filter(None, [blog_content, research_context, closed_context]))
+
     return {
-        # ── IDs ──────────────────────────────────────────
         "id":                    f"VULN_{str(uuid.uuid4())[:8].upper()}",
 
         # ── Layer 1: Vulnerability Intelligence ──────────
@@ -147,7 +209,7 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict, blog_map: dict
         "attack_method":         pentest.get("attack_method", ""),
         "payload_example":       pentest.get("payload_example", ""),
         "detection_signals":     pentest.get("detection_signals", []),
-        "real_world_exploit":    blog_content,  # <--- Injected blog data
+        "real_world_exploit":    combined_context,  # Combined from ALL sources
         "code_pattern":          pentest.get("code_pattern", ""),
 
         # ── Layer 3: Risk & Scoring ───────────────────────
@@ -177,15 +239,14 @@ def build_record(nvd_rec: dict, epss_map: dict, github_map: dict, blog_map: dict
         # ── Source tracking ───────────────────────────────
         "source":                "NVD + OWASP + FIRST EPSS" + (
             " + GitHub Advisories" if gh_advisory else ""
-        ) + (" + Security Blogs" if blog_content else ""),
+        ) + (" + Security Blogs" if blog_content else "") + (
+            " + Research Papers" if research_context else ""
+        ) + (" + Closed Sources" if closed_context else ""),
     }
 
 # ── Generate training pairs ────────────────────────────────────────────────
 
 def to_training_pairs(record: dict) -> list[dict]:
-    """
-    Generate instruction-response pairs covering all 6 dataset layers.
-    """
     cve    = record["cve_id"]
     desc   = record["description"]
     owasp  = record["owasp_category"]
@@ -200,8 +261,6 @@ def to_training_pairs(record: dict) -> list[dict]:
     ctrl   = record["security_control_missing"]
     tool   = record["tool_used"]
     cwe    = record["cwe_id"]
-    
-    # New: Real-world exploit data
     exploit_ctx = record.get("real_world_exploit", "")
 
     pairs = []
@@ -216,7 +275,7 @@ def to_training_pairs(record: dict) -> list[dict]:
             "agent":       "OWASP Mapper Agent"
         })
 
-    # ── L2: Pentesting Intelligence (Updated with Blog Data) ──────────────
+    # ── L2: Pentesting Intelligence ──────────────────────────────────────
     if method:
         pairs.append({
             "instruction": "Describe how to test for this vulnerability during a pentest.",
@@ -230,12 +289,12 @@ def to_training_pairs(record: dict) -> list[dict]:
             "agent":       "Tool Selector Agent"
         })
     
-    # NEW PAIR: Real-world exploit context from blogs
+    # NEW: Real-world context from research papers + closed sources
     if exploit_ctx:
         pairs.append({
-            "instruction": f"Provide a real-world exploit example or write-up for {cve}.",
+            "instruction": f"Provide real-world exploit examples and research findings for {cve}.",
             "input":       desc,
-            "output":      f"Here is a real-world context for {cve}:\n\n{exploit_ctx}",
+            "output":      f"Real-world context for {cve}:\n\n{exploit_ctx}",
             "layer":       "pentesting_intelligence",
             "agent":       "Scanner Agent"
         })
@@ -309,12 +368,18 @@ def run():
     nvd_records = load_json("data/raw_nvd.json")
     epss_map    = build_epss_lookup("data/raw_epss.json")
     github_map  = build_github_lookup("data/raw_github.json")
-    blog_map    = build_blog_lookup("data/raw_blogs.json") # <--- Load Blogs
+    blog_map    = build_blog_lookup("data/raw_blogs.json")
+    
+    # NEW: Load research papers and closed sources
+    papers_map  = build_papers_lookup("data/raw_papers.json")
+    closed_map  = build_closed_sources_lookup("data/raw_closed.json")
 
-    print(f"  NVD records:   {len(nvd_records)}")
-    print(f"  EPSS entries:  {len(epss_map)}")
-    print(f"  GitHub entries:{len(github_map)}")
-    print(f"  Blog entries:  {len(blog_map)} (CVEs matched)")
+    print(f"  NVD records:     {len(nvd_records)}")
+    print(f"  EPSS entries:    {len(epss_map)}")
+    print(f"  GitHub entries:  {len(github_map)}")
+    print(f"  Blog entries:    {len(blog_map)} (CVEs matched)")
+    print(f"  Research papers: {len(papers_map)} (CVEs matched)")
+    print(f"  Closed sources:  {len(closed_map)} (CVEs matched)")
 
     # ── Build full records ─────────────────────────────────────────────────
     seen_cves = set()
@@ -325,23 +390,21 @@ def run():
         cve_id = nvd_rec.get("cve_id", "")
         desc   = nvd_rec.get("description", "")
 
-        # Skip empty or duplicate
         if not desc or len(desc) < 50:
             continue
         if cve_id in seen_cves:
             continue
         seen_cves.add(cve_id)
 
-        record = build_record(nvd_rec, epss_map, github_map, blog_map) # <--- Pass map
+        record = build_record(nvd_rec, epss_map, github_map, blog_map, papers_map, closed_map)
         full_records.append(record)
         training_pairs.extend(to_training_pairs(record))
 
-    # ── Save full schema records ───────────────────────────────────────────
+    # ── Save outputs ───────────────────────────────────────────────────────
     with open("data/vuln_dataset.jsonl", "w") as f:
         for r in full_records:
             f.write(json.dumps(r) + "\n")
 
-    # ── Save training pairs ────────────────────────────────────────────────
     with open("data/training_pairs.jsonl", "w") as f:
         for p in training_pairs:
             f.write(json.dumps(p) + "\n")
@@ -355,8 +418,21 @@ def run():
     print(f"\n✅ Full schema records:  {len(full_records)} → data/vuln_dataset.jsonl")
     print(f"✅ Training pairs total: {len(training_pairs)} → data/training_pairs.jsonl")
     print("\nTraining pairs per layer:")
-    for layer, count in layer_counts.items():
+    for layer, count in sorted(layer_counts.items()):
         print(f"  {layer:<30} {count:>6} examples")
+    
+    # NEW: Show source enrichment stats
+    sources_used = {}
+    for r in full_records:
+        source_str = r.get("source", "")
+        if "Research Papers" in source_str:
+            sources_used["research_papers"] = sources_used.get("research_papers", 0) + 1
+        if "Closed Sources" in source_str:
+            sources_used["closed_sources"] = sources_used.get("closed_sources", 0) + 1
+    
+    print(f"\n📊 Source enrichment:")
+    print(f"  Records with research papers: {sources_used.get('research_papers', 0)}")
+    print(f"  Records with closed sources:  {sources_used.get('closed_sources', 0)}")
 
 if __name__ == "__main__":
     run()

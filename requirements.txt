@@ -10,3 +10,11 @@ accelerate
 bitsandbytes
 torch
 huggingface_hub
+
+#Research paper crawling
+beautifulsoup4
+PyPDF2
+scholarly
+
+#Closed source crawling
+praw
