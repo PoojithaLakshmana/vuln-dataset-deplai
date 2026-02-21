@@ -274,7 +274,7 @@ def main():
     print(f"🚀 Model live: https://huggingface.co/{HF_REPO_NAME}")
 
     from datasets import load_dataset as ld
-    full_ds = ld("json", data_files=str(Path("data") / "vuln_dataset.jsonl"), split="train")
+    full_ds = ld("json", data_files=str(DATASET_PATH), split="train")
     full_ds.push_to_hub(f"{HF_REPO_NAME}-dataset")
     print(f"🚀 Dataset live: https://huggingface.co/datasets/{HF_REPO_NAME}-dataset")
 
